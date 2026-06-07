@@ -44,8 +44,10 @@ type Job struct {
 	Status           JobStatus          `json:"status" db:"status"`
 	Type             JobType            `json:"type" db:"type"`
 	OriginalFilename string             `json:"original_filename" db:"original_filename"`
-	InputPath        string             `json:"-" db:"input_path"`
-	OutputPath       string             `json:"-" db:"output_path"`
+	// NOTE: serialized into the RabbitMQ job message (the worker needs the input
+	// path). Not exposed by the public API, which uses JobResponse, not this model.
+	InputPath        string             `json:"input_path" db:"input_path"`
+	OutputPath       string             `json:"output_path" db:"output_path"`
 	Progress         int                `json:"progress" db:"progress"`
 	InputSize        int64              `json:"input_size" db:"input_size"`
 	OutputSize       int64              `json:"output_size" db:"output_size"`

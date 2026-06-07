@@ -18,6 +18,7 @@ RUN apk add --no-cache \
     vips \
     ca-certificates \
     tzdata \
+    su-exec \
     && rm -rf /var/cache/apk/*
 
 COPY --from=builder /app/server /usr/local/bin/server
@@ -25,8 +26,6 @@ COPY --from=builder /app/migrations /migrations
 
 RUN addgroup -S app && adduser -S app -G app
 RUN mkdir -p /data && chown app:app /data
-
-USER app
 
 ENV COMPRESSOR_SERVER_HOST=0.0.0.0
 ENV COMPRESSOR_SERVER_PORT=8080
@@ -37,4 +36,6 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD wget -qO- http://localhost:8080/api/v1/health || exit 1
 
-ENTRYPOINT ["server"]
+# Railway mounts the volume root-owned, so start as root only to fix /data's
+# ownership, then drop to the unprivileged "app" user to run the server.
+ENTRYPOINT ["/bin/sh", "-c", "chown -R app:app /data && exec su-exec app server"]
