@@ -14,6 +14,7 @@ import (
 	"github.com/video-compressor/internal/broker"
 	"github.com/video-compressor/internal/compress"
 	"github.com/video-compressor/internal/model"
+	"github.com/video-compressor/internal/storage"
 )
 
 type Worker struct {
@@ -21,16 +22,18 @@ type Worker struct {
 	rdb             *redis.Client
 	videoCompressor *compress.VideoCompressor
 	imageCompressor *compress.ImageCompressor
-	storagePath     string
+	storage         storage.Storage
+	webhook         *WebhookClient
 }
 
-func New(db *sql.DB, rdb *redis.Client, storagePath string) *Worker {
+func New(db *sql.DB, rdb *redis.Client, st storage.Storage, wh *WebhookClient) *Worker {
 	return &Worker{
 		db:              db,
 		rdb:             rdb,
 		videoCompressor: compress.NewVideoCompressor(),
 		imageCompressor: compress.NewImageCompressor(),
-		storagePath:     storagePath,
+		storage:         st,
+		webhook:         wh,
 	}
 }
 
@@ -51,31 +54,46 @@ func (w *Worker) ProcessJob(ctx context.Context, msg broker.Message) error {
 	})
 
 	var outputSize int64
-	var outputPath string
+	var localOutputPath string
 
 	switch job.Type {
 	case model.TypeVideo:
 		result, err := w.processVideo(ctx, &job)
 		if err != nil {
-			w.failJob(ctx, job.ID, err)
+			w.failJob(ctx, &job, err)
 			return nil // don't requeue
 		}
 		outputSize = getFileSize(result.OutputPath)
-		outputPath = result.OutputPath
+		localOutputPath = result.OutputPath
 
 	case model.TypeImage:
 		result, err := w.processImage(ctx, &job)
 		if err != nil {
-			w.failJob(ctx, job.ID, err)
+			w.failJob(ctx, &job, err)
 			return nil
 		}
 		outputSize = result.OutputSize
-		outputPath = result.OutputPath
+		localOutputPath = result.OutputPath
 
 	default:
-		w.failJob(ctx, job.ID, fmt.Errorf("unknown job type: %s", job.Type))
+		w.failJob(ctx, &job, fmt.Errorf("unknown job type: %s", job.Type))
 		return nil
 	}
+
+	// Persist the compressed output to the configured backend (local disk or S3).
+	// Returns a filesystem path (local) or an object key (S3), stored in output_path.
+	ext := filepath.Ext(localOutputPath)
+	storedLoc, err := w.persistOutput(job.ID, ext, localOutputPath)
+	if err != nil {
+		w.failJob(ctx, &job, fmt.Errorf("failed to store output: %w", err))
+		return nil
+	}
+	mimeType := storage.ContentTypeForExt(ext)
+
+	// Free the local temp files (input + compressed temp). For local storage the
+	// final object was written under a different name and is preserved.
+	_ = os.Remove(job.InputPath)
+	_ = os.Remove(localOutputPath)
 
 	// Complete the job
 	now := time.Now()
@@ -84,10 +102,10 @@ func (w *Worker) ProcessJob(ctx context.Context, msg broker.Message) error {
 		ratio = float64(outputSize) / float64(job.InputSize)
 	}
 
-	_, err := w.db.ExecContext(ctx, `
+	_, err = w.db.ExecContext(ctx, `
 		UPDATE jobs SET status=$1, progress=100, output_path=$2, output_size=$3,
 		compression_ratio=$4, completed_at=$5, updated_at=$6 WHERE id=$7`,
-		model.StatusCompleted, outputPath, outputSize, ratio, now, now, job.ID)
+		model.StatusCompleted, storedLoc, outputSize, ratio, now, now, job.ID)
 	if err != nil {
 		return fmt.Errorf("failed to update completed job: %w", err)
 	}
@@ -100,8 +118,32 @@ func (w *Worker) ProcessJob(ctx context.Context, msg broker.Message) error {
 		"output_size":       outputSize,
 	})
 
+	// Completion webhook — detached goroutine: it must outlive the message ctx
+	// (which is cancelled once we return) and a slow backend must not block the worker.
+	if w.webhook != nil && job.WebhookURL != "" {
+		go w.webhook.Send(job.WebhookURL, WebhookPayload{
+			JobID:            job.ID,
+			Status:           "completed",
+			OutputKey:        storedLoc,
+			MimeType:         mimeType,
+			OutputSize:       outputSize,
+			CompressionRatio: ratio,
+		})
+	}
+
 	log.Printf("job %s completed (ratio=%.2f)", job.ID, ratio)
 	return nil
+}
+
+// persistOutput streams the compressed temp file into the storage backend and
+// returns its locator (path for local, object key for S3).
+func (w *Worker) persistOutput(jobID, ext, localPath string) (string, error) {
+	f, err := os.Open(localPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	return w.storage.Save(jobID, "output"+ext, f)
 }
 
 func (w *Worker) processVideo(ctx context.Context, job *model.Job) (*compress.VideoResult, error) {
@@ -111,7 +153,7 @@ func (w *Worker) processVideo(ctx context.Context, job *model.Job) (*compress.Vi
 
 	preset := resolveVideoPreset(job.Options)
 	outputExt := "." + preset.Format
-	outputPath := filepath.Join(filepath.Dir(job.InputPath), "output"+outputExt)
+	outputPath := filepath.Join(filepath.Dir(job.InputPath), "compressed"+outputExt)
 
 	onProgress := func(percent int) {
 		w.updateJobStatus(ctx, job.ID, model.StatusProcessing, percent)
@@ -130,7 +172,7 @@ func (w *Worker) processImage(ctx context.Context, job *model.Job) (*compress.Im
 
 	preset := resolveImagePreset(job.Options)
 	outputExt := "." + preset.Format
-	outputPath := filepath.Join(filepath.Dir(job.InputPath), "output"+outputExt)
+	outputPath := filepath.Join(filepath.Dir(job.InputPath), "compressed"+outputExt)
 
 	return w.imageCompressor.Compress(ctx, job.InputPath, outputPath, preset)
 }
@@ -187,16 +229,27 @@ func (w *Worker) updateJobStatus(ctx context.Context, jobID string, status model
 	return err
 }
 
-func (w *Worker) failJob(ctx context.Context, jobID string, jobErr error) {
-	log.Printf("job %s failed: %v", jobID, jobErr)
+func (w *Worker) failJob(ctx context.Context, job *model.Job, jobErr error) {
+	log.Printf("job %s failed: %v", job.ID, jobErr)
 	now := time.Now()
 	w.db.ExecContext(ctx, `
 		UPDATE jobs SET status=$1, error=$2, completed_at=$3, updated_at=$4 WHERE id=$5`,
-		model.StatusFailed, jobErr.Error(), now, now, jobID)
+		model.StatusFailed, jobErr.Error(), now, now, job.ID)
 
-	w.publishSSEEvent(ctx, jobID, "failed", map[string]interface{}{
-		"job_id": jobID, "status": "failed", "error": jobErr.Error(),
+	w.publishSSEEvent(ctx, job.ID, "failed", map[string]interface{}{
+		"job_id": job.ID, "status": "failed", "error": jobErr.Error(),
 	})
+
+	if w.webhook != nil && job.WebhookURL != "" {
+		go w.webhook.Send(job.WebhookURL, WebhookPayload{
+			JobID:  job.ID,
+			Status: "failed",
+			Error:  jobErr.Error(),
+		})
+	}
+
+	// Best-effort cleanup of the input file on failure.
+	_ = os.Remove(job.InputPath)
 }
 
 func (w *Worker) publishSSEEvent(ctx context.Context, jobID, eventType string, data map[string]interface{}) {

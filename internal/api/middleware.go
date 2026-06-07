@@ -1,7 +1,10 @@
 package api
 
 import (
+	"crypto/subtle"
 	"log"
+	"net/http"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -17,6 +20,23 @@ func LoggingMiddleware() gin.HandlerFunc {
 			c.Writer.Status(),
 			time.Since(start),
 		)
+	}
+}
+
+// APIKeyAuth rejects requests whose X-API-Key (or Bearer token) doesn't match the
+// expected key. Used as defense-in-depth on /jobs* (the service also lives on a
+// private network). Registered only when an API key is configured.
+func APIKeyAuth(expected string) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		key := c.GetHeader("X-API-Key")
+		if key == "" {
+			key = strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer ")
+		}
+		if subtle.ConstantTimeCompare([]byte(key), []byte(expected)) != 1 {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+			return
+		}
+		c.Next()
 	}
 }
 

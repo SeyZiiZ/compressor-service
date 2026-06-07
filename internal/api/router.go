@@ -6,7 +6,7 @@ import (
 	ginSwagger "github.com/swaggo/gin-swagger"
 )
 
-func SetupRouter(h *Handler) *gin.Engine {
+func SetupRouter(h *Handler, apiKey string) *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Recovery())
 	r.Use(CORSMiddleware())
@@ -20,6 +20,10 @@ func SetupRouter(h *Handler) *gin.Engine {
 		v1.GET("/health", h.Health)
 
 		jobs := v1.Group("/jobs")
+		// Optional API-key gate (health stays public for Railway healthchecks).
+		if apiKey != "" {
+			jobs.Use(APIKeyAuth(apiKey))
+		}
 		{
 			jobs.POST("", h.CreateJob)
 			jobs.GET("", h.ListJobs)

@@ -1,9 +1,11 @@
 package storage
 
 import (
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 type LocalStorage struct {
@@ -54,4 +56,9 @@ func (l *LocalStorage) GetFullPath(path string) string {
 		return path
 	}
 	return filepath.Join(l.basePath, path)
+}
+
+// PresignGetURL is not supported by local storage; callers fall back to serving the file.
+func (l *LocalStorage) PresignGetURL(path string, expiry time.Duration) (string, error) {
+	return "", errors.New("presign not supported by local storage")
 }

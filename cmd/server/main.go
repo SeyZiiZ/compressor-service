@@ -16,6 +16,7 @@ import (
 	"github.com/video-compressor/internal/api"
 	"github.com/video-compressor/internal/broker"
 	"github.com/video-compressor/internal/config"
+	"github.com/video-compressor/internal/storage"
 	"github.com/video-compressor/internal/worker"
 
 	_ "github.com/video-compressor/docs"
@@ -65,10 +66,33 @@ func main() {
 	defer rdb.Close()
 	log.Println("connected to redis")
 
-	// Storage
+	// Local staging dir for inputs + temp outputs (always needed: ffmpeg/vips work on files).
 	if err := os.MkdirAll(cfg.Storage.BasePath, 0755); err != nil {
 		log.Fatalf("failed to create storage dir: %v", err)
 	}
+
+	// Output storage backend: S3 (push compressed results to a bucket) or local disk.
+	var store storage.Storage
+	switch cfg.Storage.Driver {
+	case "s3":
+		store, err = storage.NewS3Storage(storage.S3Options{
+			Endpoint:        cfg.Storage.S3.Endpoint,
+			Region:          cfg.Storage.S3.Region,
+			Bucket:          cfg.Storage.S3.Bucket,
+			AccessKeyID:     cfg.Storage.S3.AccessKeyID,
+			SecretAccessKey: cfg.Storage.S3.SecretAccessKey,
+			ForcePathStyle:  cfg.Storage.S3.ForcePathStyle,
+		})
+	default:
+		store, err = storage.NewLocalStorage(cfg.Storage.BasePath)
+	}
+	if err != nil {
+		log.Fatalf("failed to init storage backend (%s): %v", cfg.Storage.Driver, err)
+	}
+	log.Printf("storage backend: %s", cfg.Storage.Driver)
+
+	// Webhook client for completion callbacks to the calling backend.
+	webhookClient := worker.NewWebhookClient(cfg.Webhook.Secret, cfg.Webhook.TimeoutSeconds)
 
 	// RabbitMQ
 	rmq, err := broker.NewRabbitMQ(cfg.RabbitMQ.URL)
@@ -83,7 +107,7 @@ func main() {
 	defer cancel()
 
 	// Worker pool
-	w := worker.New(db, rdb, cfg.Storage.BasePath)
+	w := worker.New(db, rdb, store, webhookClient)
 	pool := worker.NewPool(w, rmq)
 	go func() {
 		if err := pool.Start(ctx, cfg.Worker.VideoWorkers, cfg.Worker.ImageWorkers); err != nil {
@@ -93,8 +117,8 @@ func main() {
 	log.Printf("worker pool started (video=%d, image=%d)", cfg.Worker.VideoWorkers, cfg.Worker.ImageWorkers)
 
 	// HTTP API
-	handler := api.NewHandler(db, rdb, rmq, cfg.Storage.BasePath)
-	router := api.SetupRouter(handler)
+	handler := api.NewHandler(db, rdb, rmq, store, cfg.Storage.BasePath)
+	router := api.SetupRouter(handler, cfg.Server.APIKey)
 	addr := fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port)
 	srv := &http.Server{
 		Addr:    addr,

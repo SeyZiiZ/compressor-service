@@ -17,20 +17,23 @@ import (
 	"github.com/redis/go-redis/v9"
 	"github.com/video-compressor/internal/broker"
 	"github.com/video-compressor/internal/model"
+	"github.com/video-compressor/internal/storage"
 )
 
 type Handler struct {
 	db          *sql.DB
 	rdb         *redis.Client
 	broker      broker.Broker
+	storage     storage.Storage
 	storagePath string
 }
 
-func NewHandler(db *sql.DB, rdb *redis.Client, b broker.Broker, storagePath string) *Handler {
+func NewHandler(db *sql.DB, rdb *redis.Client, b broker.Broker, st storage.Storage, storagePath string) *Handler {
 	return &Handler{
 		db:          db,
 		rdb:         rdb,
 		broker:      b,
+		storage:     st,
 		storagePath: storagePath,
 	}
 }
@@ -288,6 +291,13 @@ func (h *Handler) DownloadJob(c *gin.Context) {
 		return
 	}
 
+	// S3-backed storage: redirect to a short-lived presigned URL (bucket egress is free).
+	if url, err := h.storage.PresignGetURL(job.OutputPath, 5*time.Minute); err == nil && url != "" {
+		c.Redirect(http.StatusFound, url)
+		return
+	}
+
+	// Local storage fallback: stream the file from disk.
 	if _, err := os.Stat(job.OutputPath); os.IsNotExist(err) {
 		c.JSON(http.StatusNotFound, ErrorResponse{Error: "output file not found"})
 		return
@@ -324,9 +334,11 @@ func (h *Handler) DeleteJob(c *gin.Context) {
 		return
 	}
 
-	// Clean up files
-	jobDir := filepath.Join(h.storagePath, job.ID)
-	os.RemoveAll(jobDir)
+	// Clean up the stored output (S3 object or local file) plus any local staging dir.
+	if job.OutputPath != "" {
+		_ = h.storage.Delete(job.OutputPath)
+	}
+	os.RemoveAll(filepath.Join(h.storagePath, job.ID))
 
 	// Delete from DB
 	h.db.ExecContext(c.Request.Context(), "DELETE FROM jobs WHERE id=$1", jobID)
